@@ -1,0 +1,110 @@
+# Gemini model configuration for Claude Code delegation
+# Updated: 2026-02-23
+
+models:
+  # --- Pro tier: Complex reasoning, architecture, security ---
+  pro:
+    id: "gemini-3.1-pro-preview"
+    context_window: 1048576  # 1M tokens
+    max_output: 65536
+    pricing:
+      input_per_1m: 1.25
+      output_per_1m: 10.00
+    strengths:
+      - complex reasoning
+      - architecture review
+      - security analysis
+      - code review
+      - vision (multimodal)
+    use_when:
+      - "task requires deep reasoning"
+      - "content > 500K tokens"
+      - "security or architecture review"
+      - "image/screenshot analysis"
+
+  # --- 2.5 Pro: Stable production model ---
+  2.5-pro:
+    id: "gemini-2.5-pro"
+    context_window: 1048576
+    max_output: 65536
+    pricing:
+      input_per_1m: 1.25
+      output_per_1m: 10.00
+    strengths:
+      - stable production use
+      - text analysis
+      - code generation
+    use_when:
+      - "need stable (non-preview) model"
+      - "production-grade output needed"
+
+  # --- Flash tier: Fast, cheap, bulk operations ---
+  flash:
+    id: "gemini-2.5-flash"
+    context_window: 1048576
+    max_output: 65536
+    pricing:
+      input_per_1m: 0.15
+      output_per_1m: 0.60
+    strengths:
+      - fast response
+      - cost effective
+      - summarization
+      - simple Q&A
+      - bulk processing
+    use_when:
+      - "simple tasks (summarize, format, extract)"
+      - "bulk file processing"
+      - "cost-sensitive operations"
+      - "< 100K token context"
+
+  flash-preview:
+    id: "gemini-2.5-flash-preview"
+    context_window: 1048576
+    max_output: 65536
+    pricing:
+      input_per_1m: 0.15
+      output_per_1m: 0.60
+    strengths:
+      - latest flash features
+      - thinking/reasoning
+    use_when:
+      - "need flash-speed with some reasoning"
+
+# Auto-routing rules
+routing:
+  # Task keywords -> model selection
+  pro_signals:
+    - architect
+    - security
+    - threat
+    - design
+    - review
+    - debug
+    - complex
+    - vulnerability
+  flash_signals:
+    - summarize
+    - format
+    - extract
+    - list
+    - count
+    - simple
+    - quick
+
+  # Content size thresholds
+  size_routing:
+    flash_max: 500000    # Use flash for content under 500K chars
+    pro_min: 500000      # Upgrade to pro above 500K chars
+
+# Budget defaults
+budget:
+  daily_limit_usd: 5.00
+  warn_at_percent: 80
+  hard_stop_at_percent: 100
+
+# Cache settings
+cache:
+  enabled: true
+  ttl_seconds: 3600
+  directory: "~/.cache/claude-gemini"

@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""gemini - CLI bridge for Claude Code to delegate heavy lifting to Gemini API.
+
+Usage:
+    gemini analyze [--file FILE...] [--focus FOCUS] [--model MODEL]
+    gemini summarize [--file FILE...] [--length short|medium|long] [--model MODEL]
+    gemini vision [--image IMAGE...] [--task describe|ui-review|extract-text|debug]
+    gemini generate [--file FILE...] [--lang LANG] [--model MODEL] PROMPT
+    gemini ask [--file FILE...] [--model MODEL] QUESTION
+    gemini diff [--file FILE...] [--model MODEL]
+    gemini bulk [--file FILE...] [--op OPERATION] [--model MODEL]
+    gemini cost                     # Show today's spending
+    gemini cache-clear              # Clear response cache
+    gemini models                   # List available models
+    gemini raw [--model MODEL] [--no-json] [--system SYS] PROMPT  # Raw API call
+
+Stdin support:
+    cat large_file.py | gemini analyze --focus "security"
+    git diff | gemini diff
+    find . -name "*.py" -exec cat {} + | gemini summarize
+
+Environment:
+    GEMINI_API_KEY       Required. Set in environment or ~/.secrets/.env
+    GEMINI_DAILY_BUDGET  Daily spend limit in USD (default: 5.00)
+    GEMINI_CACHE_DIR     Cache directory (default: ~/.cache/claude-gemini)
+
+Output:
+    All commands return structured JSON to stdout.
+    Errors go to stderr.
+"""
+import argparse
+import json
+import sys
+import os
+from pathlib import Path
+
+# Add project root to path (realpath resolves symlinks like /usr/local/bin/gemini)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+from lib.client import generate, route_model
+from lib.prompts.templates import (
+    get_analyze_prompt,
+    get_summarize_prompt,
+    get_vision_prompt,
+    get_generate_prompt,
+    get_ask_prompt,
+    get_diff_prompt,
+    get_bulk_prompt,
+)
+from lib import cost, cache
+
+
+def _add_think_args(parser: argparse.ArgumentParser) -> None:
+    """Add --no-think, --tier, and --thinking-budget to a subparser."""
+    parser.add_argument("--no-think", action="store_true",
+                        help="Disable deep thinking (faster, cheaper)")
+    parser.add_argument("--tier", choices=["low", "medium", "high", "max"], default=None,
+                        help="Thinking tier: low|medium|high|max (default: high)")
+    parser.add_argument("--thinking-budget", type=int, default=None,
+                        help="Explicit token budget for thinking (overrides --tier)")
+
+
+def _think_kwargs(args) -> dict:
+    """Extract think kwargs from parsed args."""
+    return {
+        "think": not getattr(args, "no_think", False),
+        "tier": getattr(args, "tier", None),
+        "thinking_budget": getattr(args, "thinking_budget", None),
+    }
+
+
+def read_stdin() -> str:
+    """Read from stdin if available (piped data)."""
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return ""
+
+
+def read_files(file_paths: list[str] | None) -> list[str]:
+    """Validate and return file paths."""
+    if not file_paths:
+        return []
+    valid = []
+    for f in file_paths:
+        if os.path.exists(f):
+            valid.append(f)
+        else:
+            print(json.dumps({"warning": f"File not found: {f}"}), file=sys.stderr)
+    return valid
+
+
+def output(result: dict) -> None:
+    """Print result as JSON to stdout. Exit non-zero on errors."""
+    print(json.dumps(result, indent=2, default=str))
+    if result.get("status") == "error":
+        sys.exit(1)
+
+
+def cmd_analyze(args):
+    files = read_files(args.file)
+    stdin_content = read_stdin()
+
+    if not files and not stdin_content:
+        output({"status": "error", "error": "No input provided. Use --file or pipe content via stdin."})
+        return
+
+    system, prompt = get_analyze_prompt(args.focus or "")
+
+    if stdin_content:
+        prompt = f"{stdin_content}\n\n{prompt}"
+
+    model = args.model or route_model("analyze", sum(os.path.getsize(f) for f in files) if files else len(stdin_content), args.focus or "")
+
+    result = generate(
+        prompt,
+        model=model,
+        system_instruction=system,
+        files=files,
+        task_label="analyze",
+        **_think_kwargs(args),
+    )
+    output(result)
+
+
+def cmd_summarize(args):
+    files = read_files(args.file)
+    stdin_content = read_stdin()
+    system, prompt = get_summarize_prompt(args.length or "medium")
+
+    if stdin_content:
+        prompt = f"{stdin_content}\n\n{prompt}"
+
+    model = args.model or "flash"
+
+    result = generate(
+        prompt,
+        model=model,
+        system_instruction=system,
+        files=files,
+        task_label="summarize",
+        **_think_kwargs(args),
+    )
+    output(result)
+
+
+def cmd_vision(args):
+    if not args.image:
+        print(json.dumps({"error": "No images provided. Use --image PATH"}), file=sys.stderr)
+        sys.exit(1)
+
+    system, prompt = get_vision_prompt(args.task or "describe")
+    model = args.model or "pro"  # Vision needs Pro
+
+    result = generate(
+        prompt,
+        model=model,
+        system_instruction=system,
+        images=args.image,
+        task_label="vision",
+        **_think_kwargs(args),
+    )
+    output(result)
+
+
+def cmd_generate(args):
+    files = read_files(args.file)
+    stdin_content = read_stdin()
+    system, prompt_template = get_generate_prompt(args.lang or "", "")
+
+    user_prompt = " ".join(args.prompt) if args.prompt else ""
+    if stdin_content:
+        user_prompt = f"{stdin_content}\n\n{user_prompt}"
+
+    full_prompt = f"{user_prompt}\n\n{prompt_template}"
+    model = args.model or route_model("generate", len(user_prompt))
+
+    result = generate(
+        full_prompt,
+        model=model,
+        system_instruction=system,
+        files=files,
+        task_label="generate",
+        **_think_kwargs(args),
+    )
+    output(result)
+
+
+def cmd_ask(args):
+    files = read_files(args.file)
+    stdin_content = read_stdin()
+    system, prompt_template = get_ask_prompt()
+
+    question = " ".join(args.question) if args.question else ""
+    if stdin_content:
+        question = f"Context:\n{stdin_content}\n\nQuestion: {question}"
+
+    full_prompt = f"{question}\n\n{prompt_template}"
+    model = args.model or route_model("ask", len(question))
+
+    result = generate(
+        full_prompt,
+        model=model,
+        system_instruction=system,
+        files=files,
+        task_label="ask",
+        **_think_kwargs(args),
+    )
+    output(result)
+
+
+def cmd_diff(args):
+    files = read_files(args.file)
+    stdin_content = read_stdin()
+    system, prompt = get_diff_prompt()
+
+    if stdin_content:
+        prompt = f"{stdin_content}\n\n{prompt}"
+
+    model = args.model or "pro"  # Diff review benefits from Pro
+
+    result = generate(
+        prompt,
+        model=model,
+        system_instruction=system,
+        files=files,
+        task_label="diff",
+        **_think_kwargs(args),
+    )
+    output(result)
+
+
+def cmd_bulk(args):
+    files = read_files(args.file)
+    stdin_content = read_stdin()
+    system, prompt = get_bulk_prompt(args.op or "summarize")
+
+    if stdin_content:
+        prompt = f"{stdin_content}\n\n{prompt}"
+
+    model = args.model or "flash"  # Bulk = cost-effective
+
+    result = generate(
+        prompt,
+        model=model,
+        system_instruction=system,
+        files=files,
+        task_label="bulk",
+        **_think_kwargs(args),
+    )
+    output(result)
+
+
+def cmd_reason(args):
+    """Pure reasoning dispatch — Gemini as Naked Reasoner.
+
+    Forces Pro model, MAX tier, no JSON mode (free-form reasoning output).
+    Applies the Naked Reasoner system instruction.
+    This is the DECOMPOSE -> ROUTE -> VERIFY -> EXECUTE pipeline's core.
+    """
+    from lib.client import NAKED_REASONER_INSTRUCTION
+
+    files = read_files(args.file)
+    stdin_content = read_stdin()
+
+    # Build the isolated reasoning prompt
+    problem = " ".join(args.problem) if args.problem else ""
+    if stdin_content:
+        problem = f"{stdin_content}\n\n{problem}"
+
+    # Optionally read from a prompt file
+    if args.prompt_file:
+        try:
+            with open(args.prompt_file) as f:
+                file_problem = f.read()
+            problem = f"{file_problem}\n\n{problem}" if problem else file_problem
+        except OSError as e:
+            output({"status": "error", "error": f"Cannot read prompt file: {e}"})
+            return
+
+    if not problem.strip():
+        output({"status": "error", "error": "No reasoning problem provided. Use positional args, --prompt-file, or stdin."})
+        return
+
+    # Always Pro, always MAX thinking, free-form output
+    tier = args.tier or "max"
+    model = args.model or "pro"
+
+    result = generate(
+        problem,
+        model=model,
+        system_instruction=NAKED_REASONER_INSTRUCTION,
+        files=files,
+        json_mode=False,  # Pure reasoning = free-form text
+        task_label="reason",
+        think=True,
+        tier=tier,
+        thinking_budget=args.thinking_budget,
+        max_tokens=args.max_tokens or 16384,
+    )
+
+    # Save output to file if requested
+    if args.output:
+        try:
+            out_path = Path(args.output).resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "w") as f:
+                if isinstance(result.get("response"), str):
+                    f.write(result["response"])
+                else:
+                    f.write(json.dumps(result, indent=2, default=str))
+            result["saved_to"] = str(out_path)
+        except OSError as e:
+            result["save_error"] = str(e)
+
+    output(result)
+
+
+def cmd_raw(args):
+    stdin_content = read_stdin()
+    prompt = " ".join(args.prompt) if args.prompt else ""
+    if stdin_content:
+        prompt = f"{stdin_content}\n\n{prompt}"
+
+    model = args.model or "flash"
+    json_mode = not args.no_json
+
+    result = generate(
+        prompt,
+        model=model,
+        system_instruction=args.system or "",
+        json_mode=json_mode,
+        task_label="raw",
+        **_think_kwargs(args),
+    )
+    output(result)
+
+
+def cmd_cost(args):
+    output(cost.summary())
+
+
+def cmd_cache_clear(args):
+    count = cache.clear()
+    output({"cleared": count, "status": "ok"})
+
+
+def cmd_models(args):
+    from lib.client import MODELS, THINKING_TIERS, DEFAULT_TIER
+    output({
+        "aliases": MODELS,
+        "default": "flash",
+        "routing": "auto-selects pro for complex tasks, flash for simple ones",
+        "deep_think": {
+            "enabled_by_default": True,
+            "default_tier": DEFAULT_TIER,
+            "tiers": THINKING_TIERS,
+            "disable_with": "--no-think",
+        },
+    })
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Gemini API bridge for Claude Code",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  gemini reason 'Prove the logical flaw in this concurrent algorithm' --tier max\n"
+               "  gemini reason --prompt-file problem.md --tier high -o solution.md\n"
+               "  gemini analyze --file main.py --focus security\n"
+               "  cat *.log | gemini summarize --length short --tier low\n"
+               "  gemini vision --image screenshot.png --task ui-review\n"
+               "  git diff HEAD~3 | gemini diff\n"
+               "  gemini ask --file api.py 'What auth method does this use?'\n"
+               "  gemini cost\n",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # reason (Naked Reasoner — pure deduction dispatch)
+    p = subparsers.add_parser("reason", help="Pure reasoning dispatch (Naked Reasoner mode)",
+                              description="Route pure reasoning bottlenecks to Gemini 3.1 Pro.\n"
+                                          "Forces Pro model, MAX thinking tier, free-form output.\n"
+                                          "DECOMPOSE -> ROUTE -> VERIFY -> EXECUTE.")
+    p.add_argument("problem", nargs="*", help="The reasoning problem to solve")
+    p.add_argument("--prompt-file", "-p", help="Path to isolated problem file (.md/.txt)")
+    p.add_argument("--file", "-f", action="append", help="Context file(s) to include")
+    p.add_argument("--model", "-m", help="Model override (default: pro)")
+    p.add_argument("--output", "-o", help="Save Gemini's reasoning output to this file")
+    p.add_argument("--max-tokens", type=int, default=None, help="Max output tokens (default: 16384)")
+    _add_think_args(p)
+    p.set_defaults(func=cmd_reason)
+
+    # analyze
+    p = subparsers.add_parser("analyze", help="Analyze code files")
+    p.add_argument("--file", "-f", action="append", help="File(s) to analyze")
+    p.add_argument("--focus", help="Focus area (security, performance, patterns, etc.)")
+    p.add_argument("--model", "-m", help="Model override (pro, flash, or full ID)")
+    _add_think_args(p)
+    p.set_defaults(func=cmd_analyze)
+
+    # summarize
+    p = subparsers.add_parser("summarize", help="Summarize content")
+    p.add_argument("--file", "-f", action="append", help="File(s) to summarize")
+    p.add_argument("--length", "-l", choices=["short", "medium", "long"], default="medium")
+    p.add_argument("--model", "-m", help="Model override")
+    _add_think_args(p)
+    p.set_defaults(func=cmd_summarize)
+
+    # vision
+    p = subparsers.add_parser("vision", help="Analyze images/screenshots")
+    p.add_argument("--image", "-i", action="append", required=True, help="Image file(s)")
+    p.add_argument("--task", "-t", choices=["describe", "ui-review", "extract-text", "compare", "debug"], default="describe")
+    p.add_argument("--model", "-m", help="Model override")
+    _add_think_args(p)
+    p.set_defaults(func=cmd_vision)
+
+    # generate
+    p = subparsers.add_parser("generate", help="Generate code")
+    p.add_argument("prompt", nargs="*", help="Generation prompt")
+    p.add_argument("--file", "-f", action="append", help="Context file(s)")
+    p.add_argument("--lang", help="Target language")
+    p.add_argument("--model", "-m", help="Model override")
+    _add_think_args(p)
+    p.set_defaults(func=cmd_generate)
+
+    # ask
+    p = subparsers.add_parser("ask", help="Ask a question with context")
+    p.add_argument("question", nargs="*", help="Question to ask")
+    p.add_argument("--file", "-f", action="append", help="Context file(s)")
+    p.add_argument("--model", "-m", help="Model override")
+    _add_think_args(p)
+    p.set_defaults(func=cmd_ask)
+
+    # diff
+    p = subparsers.add_parser("diff", help="Review code changes")
+    p.add_argument("--file", "-f", action="append", help="Diff file(s)")
+    p.add_argument("--model", "-m", help="Model override")
+    _add_think_args(p)
+    p.set_defaults(func=cmd_diff)
+
+    # bulk
+    p = subparsers.add_parser("bulk", help="Batch process files")
+    p.add_argument("--file", "-f", action="append", help="File(s) to process")
+    p.add_argument("--op", help="Operation (summarize, analyze, extract)")
+    p.add_argument("--model", "-m", help="Model override")
+    _add_think_args(p)
+    p.set_defaults(func=cmd_bulk)
+
+    # raw
+    p = subparsers.add_parser("raw", help="Raw Gemini API call")
+    p.add_argument("prompt", nargs="*", help="Prompt text")
+    p.add_argument("--model", "-m", help="Model override")
+    p.add_argument("--system", "-s", help="System instruction")
+    p.add_argument("--no-json", action="store_true", help="Disable JSON mode")
+    _add_think_args(p)
+    p.set_defaults(func=cmd_raw)
+
+    # cost
+    p = subparsers.add_parser("cost", help="Show today's spending")
+    p.set_defaults(func=cmd_cost)
+
+    # cache-clear
+    p = subparsers.add_parser("cache-clear", help="Clear response cache")
+    p.set_defaults(func=cmd_cache_clear)
+
+    # models
+    p = subparsers.add_parser("models", help="List available models")
+    p.set_defaults(func=cmd_models)
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
