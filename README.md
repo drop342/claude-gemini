@@ -54,7 +54,7 @@ All commands have deep thinking enabled by default via Gemini's `ThinkingConfig`
 ## Setup
 
 ```bash
-git clone https://github.com/HeraclesBass/claude-gemini.git
+git clone https://github.com/herakles-dev/claude-gemini.git
 cd claude-gemini
 pip install -r requirements.txt
 
@@ -116,4 +116,4 @@ Python, Google GenAI SDK
 
 ---
 
-Built by [D. Michael Piscitelli](https://github.com/HeraclesBass) | [herakles.dev](https://herakles.dev)
+Built by [D. Michael Piscitelli](https://github.com/herakles-dev) | [herakles.dev](https://herakles.dev)
